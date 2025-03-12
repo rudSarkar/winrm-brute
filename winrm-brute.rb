@@ -16,6 +16,7 @@
 require 'optparse'
 require 'ostruct'
 require 'winrm'
+require 'thread'
 
 # Extends string class with colorized output
 class String
@@ -75,19 +76,43 @@ end
 
 # Print a message to show login attempt
 def print_attempt(config, quiet)
-  puts "Trying #{config[:user]}:#{config[:password]}" unless quiet
+  # Use mutex to prevent output garbling when threading
+  $stdout_mutex.synchronize do
+    puts "Trying #{config[:user]}:#{config[:password]}" unless quiet
+  end
 end
 
 # Print valid credentials
 def check_creds(credentials)
   if credentials
-    puts "[SUCCESS] user: #{credentials[:user]} password: #{credentials[:password]}".green
+    $stdout_mutex.synchronize do
+      puts "[SUCCESS] user: #{credentials[:user]} password: #{credentials[:password]}".green
+    end
+    # Add successful credentials to our shared array
+    $successful_creds_mutex.synchronize do
+      $successful_creds << credentials
+    end
   end
+end
+
+# Initialize mutexes for thread safety
+$stdout_mutex = Mutex.new
+$successful_creds_mutex = Mutex.new
+$successful_creds = []
+$thread_count_mutex = Mutex.new
+$active_threads = 0
+
+# Function to process a single credential pair
+def process_credential(auth, quiet)
+  print_attempt(auth, quiet)
+  check_creds(try_login(auth))
 end
 
 # Set a trap to avoid error messages on Ctrl+C
 trap "SIGINT" do
-  STDERR.puts "Execution interrupted by user"
+  $stdout_mutex.synchronize do
+    STDERR.puts "Execution interrupted by user"
+  end
   exit 130
 end
 
@@ -95,6 +120,7 @@ options = OpenStruct.new
 options.uri = "/wsman"
 options.port = "5985"
 options.timeout = 1
+options.threads = 10 # Default number of threads
 
 optparse = OptionParser.new do |opts|
   opts.banner = "Usage: winrm-brute.rb [options]"
@@ -123,6 +149,11 @@ optparse = OptionParser.new do |opts|
   opts.on("-t TIMEOUT",
           "Timeout for each attempt, in seconds (default: 1)") do |timeout|
     options.timeout = timeout
+  end
+
+  opts.on("-T THREADS",
+          "Number of threads to use (default: 10)") do |threads|
+    options.threads = threads.to_i
   end
 
   opts.on("-q", "--quiet",
@@ -184,19 +215,59 @@ auth = {
   retry_limit: 1
 }
 
-# Run for a specific user
+# Create a thread pool
+thread_pool = Queue.new
+
+# Function to manage threads
+def thread_manager(thread_pool, max_threads)
+  loop do
+    # Break if no more work and no active threads
+    if thread_pool.empty? && $active_threads == 0
+      break
+    end
+    
+    # If we have capacity and work to do, start a new thread
+    if $active_threads < max_threads && !thread_pool.empty?
+      $thread_count_mutex.synchronize { $active_threads += 1 }
+      
+      # Get the next credential to process
+      credential = thread_pool.pop
+      
+      Thread.new do
+        begin
+          process_credential(credential[:auth], credential[:quiet])
+        rescue => e
+          $stdout_mutex.synchronize do
+            puts "Thread error: #{e.message}".red
+          end
+        ensure
+          # Decrement thread count when done
+          $thread_count_mutex.synchronize { $active_threads -= 1 }
+        end
+      end
+    end
+    
+    # Small sleep to prevent CPU hogging
+    sleep 0.1
+  end
+end
+
+# Function to queue credential attempts
+def queue_credential(thread_pool, auth, quiet)
+  thread_pool << { auth: auth.dup, quiet: quiet }
+end
+
+# Generate all credential pairs and add to queue
 if options.user
   auth[:user] = options.user
   if options.passwd
     auth[:password] = options.passwd
-    print_attempt(auth, options.quiet)
-    check_creds(try_login(auth))
+    queue_credential(thread_pool, auth, options.quiet)
   end
   if options.passwdfile
     File.readlines(options.passwdfile, chomp: true).each do |p|
       auth[:password] = p
-      print_attempt(auth, options.quiet)
-      check_creds(try_login(auth))
+      queue_credential(thread_pool, auth, options.quiet)
     end
   end
 end
@@ -206,15 +277,27 @@ if options.userfile
     auth[:user] = user
     if options.passwd
       auth[:password] = options.passwd
-      print_attempt(auth, options.quiet)
-      check_creds(try_login(auth))
+      queue_credential(thread_pool, auth, options.quiet)
     end
     if options.passwdfile
       File.readlines(options.passwdfile, chomp: true).each do |passwd|
         auth[:password] = passwd
-        print_attempt(auth, options.quiet)
-        check_creds(try_login(auth))
+        queue_credential(thread_pool, auth, options.quiet)
       end
     end
+  end
+end
+
+# Start the thread manager
+puts "Starting bruteforce with #{options.threads} threads...".blue
+thread_manager(thread_pool, options.threads)
+
+# Summary of results
+if $successful_creds.empty?
+  puts "No valid credentials found.".yellow
+else
+  puts "\nSummary of valid credentials:".blue
+  $successful_creds.each do |cred|
+    puts "User: #{cred[:user]} | Password: #{cred[:password]}".green
   end
 end
